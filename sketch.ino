@@ -1,10 +1,12 @@
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <TinyGPSPlus.h>
 #include <ArduinoJson.h>
 #include <string.h>
 #include <time.h>
 #include <stdint.h>
+#include "secrets.h"
 
 #define ESP32_RX2_PIN 16
 #define ESP32_TX2_PIN 17
@@ -13,13 +15,14 @@
 #define LED_B_PIN 33
 #define DEVICE_ID "esp32:001"
 
-const char* wifi_ssid = "Hotspot T";
-const char* wifi_password = "kampungsteak";
+const char* wifi_ssid = WIFI_SSID;
+const char* wifi_password = WIFI_PASSWORD;
 
-const char* mqtt_server = "test.mosquitto.org";
-const uint16_t mqtt_port = 1884;
-const char* mqtt_username = "rw";
-const char* mqtt_password = "readwrite";
+const char* mqtt_server = MQTT_HOST;
+const uint16_t mqtt_port = MQTT_PORT;
+const char* mqtt_username = MQTT_USERNAME;
+const char* mqtt_password = MQTT_PASSWORD;
+const char* mqtt_root_ca = MQTT_ROOT_CA;
 
 const char* mqtt_topic = "tracker/devices/" DEVICE_ID "/telemetry";
 const char* mqtt_command_topic = "tracker/devices/" DEVICE_ID "/command";
@@ -36,7 +39,7 @@ const unsigned long blip_ms = 100;
 
 HardwareSerial gps_serial(2);
 TinyGPSPlus gps;
-WiFiClient mqtt_client;
+WiFiClientSecure mqtt_client;
 PubSubClient mqtt(mqtt_client);
 
 unsigned long last_send = 0;
@@ -159,20 +162,23 @@ void maintain_wifi() {
 }
 
 void initialize_mqtt() {
+    mqtt_client.setCACert(mqtt_root_ca);
+    mqtt_client.setHandshakeTimeout(10);
+
     mqtt.setServer(mqtt_server, mqtt_port);
     mqtt.setKeepAlive(mqtt_keep_alive);
     mqtt.setSocketTimeout(5);
     mqtt.setBufferSize(512);
     mqtt.setCallback(on_message);
 
-    Serial.printf("[MQTT] Broker | %s:%u\n", mqtt_server, mqtt_port);
+    Serial.printf("[MQTT] TLS Broker | %s:%u\n", mqtt_server, mqtt_port);
 }
 
 void reconnect_mqtt() {
     if (mqtt.connected()) {
         if (!mqtt_connected_before) {
             mqtt_connected_before = true;
-            Serial.println("[MQTT] Connected");
+            Serial.println("[MQTT] Connected (TLS)");
         }
         return;
     }
@@ -187,18 +193,29 @@ void reconnect_mqtt() {
     }
 
     last_mqtt_attempt = millis();
-    Serial.println("[MQTT] Reconnecting...");
+
+    if (time(nullptr) < 1700000000) {
+        Serial.println("[TLS] Waiting for NTP time sync...");
+        return;
+    }
+
+    Serial.println("[MQTT] Reconnecting (TLS)...");
 
     if (mqtt.connect(DEVICE_ID, mqtt_username, mqtt_password)) {
         if (mqtt.subscribe(mqtt_command_topic)) {
             mqtt_connected_before = true;
-            Serial.println("[MQTT] Connected | Command subscribed");
+            Serial.println("[MQTT] Connected (TLS) | Command subscribed");
         } else {
-            Serial.println("[MQTT] Connected | Subscribe failed");
+            Serial.println("[MQTT] Connected (TLS) | Subscribe failed");
             mqtt.disconnect();
         }
     } else {
         Serial.printf("[MQTT] Connect failed | State=%d\n", mqtt.state());
+
+        char tls_err[128];
+        if (mqtt_client.lastError(tls_err, sizeof(tls_err)) < 0) {
+            Serial.printf("[TLS] Error | %s\n", tls_err);
+        }
     }
 }
 

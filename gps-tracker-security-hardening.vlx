@@ -1,0 +1,528 @@
+{
+  "format": "velxio-project",
+  "version": 1,
+  "exportedAt": "2026-11-25T14:44:20.266Z",
+  "name": "sketch",
+  "boards": [
+    {
+      "id": "esp32",
+      "boardKind": "esp32",
+      "x": 837.4043709038053,
+      "y": 193.75075567280373,
+      "activeFileGroupId": "group-esp32",
+      "languageMode": "arduino",
+      "serialBaudRate": 0,
+      "libraries": [
+        "WiFi",
+        "PubSubClient",
+        "TinyGPSPlus",
+        "ArduinoJson"
+      ]
+    }
+  ],
+  "fileGroups": {
+    "group-esp32": [
+      {
+        "name": "secrets.h",
+        "content": "#pragma once\n\n#include <pgmspace.h>\n\n// WiFi Credentials\n#define WIFI_SSID \"Velxio-GUEST\"\n#define WIFI_PASSWORD \"\"\n\n// MQTT Broker & Playit Tunnel Config\n#define MQTT_HOST \"mqtt.domain.com\"\n#define MQTT_PORT 12345\n#define MQTT_USERNAME \"mqtt\"\n#define MQTT_PASSWORD \"xxx\"\n\n// Let's Encrypt Root CA (ISRG Root X1)\nstatic const char MQTT_ROOT_CA[] PROGMEM = R\"EOF(\n-----BEGIN CERTIFICATE-----\nxxxx\nxxxx\nxxxx\nxxxx\n-----END CERTIFICATE-----\n)EOF\";"
+      },
+      {
+        "name": "sketch.ino",
+        "content": "#include <WiFi.h>\n#include <WiFiClientSecure.h>\n#include <PubSubClient.h>\n#include <TinyGPSPlus.h>\n#include <ArduinoJson.h>\n#include <string.h>\n#include <time.h>\n#include <stdint.h>\n#include \"secrets.h\"\n\n#define ESP32_RX2_PIN 16\n#define ESP32_TX2_PIN 17\n#define GPS_BAUD 9600\n#define LED_A_PIN 32\n#define LED_B_PIN 33\n#define DEVICE_ID \"esp32:001\"\n\nconst char* wifi_ssid = WIFI_SSID;\nconst char* wifi_password = WIFI_PASSWORD;\n\nconst char* mqtt_server = MQTT_HOST;\nconst uint16_t mqtt_port = MQTT_PORT;\nconst char* mqtt_username = MQTT_USERNAME;\nconst char* mqtt_password = MQTT_PASSWORD;\nconst char* mqtt_root_ca = MQTT_ROOT_CA;\n\nconst char* mqtt_topic = \"tracker/devices/\" DEVICE_ID \"/telemetry\";\nconst char* mqtt_command_topic = \"tracker/devices/\" DEVICE_ID \"/command\";\n\nconst uint16_t mqtt_keep_alive = 60;\nconst size_t msg_size = 256;\nconst size_t cmd_size = 192;\n\nconst unsigned long wifi_retry_ms = 10000;\nconst unsigned long mqtt_retry_ms = 5000;\nconst unsigned long blink_fast_ms = 150;\nconst unsigned long blink_slow_ms = 500;\nconst unsigned long blip_ms = 100;\n\nHardwareSerial gps_serial(2);\nTinyGPSPlus gps;\nWiFiClientSecure mqtt_client;\nPubSubClient mqtt(mqtt_client);\n\nunsigned long last_send = 0;\nunsigned long last_publish_ok = 0;\nunsigned long last_wifi_attempt = 0;\nunsigned long last_mqtt_attempt = 0;\nunsigned long last_led_a_toggle = 0;\nunsigned long last_led_b_toggle = 0;\n\nuint32_t last_command_timestamp = 0;\n\nbool wifi_connected_before = false;\nbool mqtt_connected_before = false;\nbool gps_enabled = false;\nbool led_a_state = false;\nbool led_b_state = false;\n\nint interval_seconds = 10;\nint last_gps_fix_state = -1;\n\nvoid on_message(char* topic, byte* payload, unsigned int length);\n\nint64_t days_from_civil(int year, unsigned month, unsigned day) {\n    year -= month <= 2;\n    const int era = (year >= 0 ? year : year - 399) / 400;\n    const unsigned year_of_era = (unsigned)(year - era * 400);\n    const unsigned month_prime = (unsigned)((int)month + (month > 2 ? -3 : 9));\n    const unsigned day_of_year = (153 * month_prime + 2) / 5 + day - 1;\n    const unsigned day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;\n\n    return (int64_t)era * 146097 + (int64_t)day_of_era - 719468;\n}\n\nuint32_t gps_epoch() {\n    if (!gps.date.isValid() || !gps.time.isValid()) {\n        return 0;\n    }\n\n    int64_t timestamp =\n        days_from_civil(gps.date.year(), gps.date.month(), gps.date.day()) * 86400LL +\n        gps.time.hour() * 3600LL +\n        gps.time.minute() * 60LL +\n        gps.time.second();\n\n    if (timestamp <= 0 || timestamp > UINT32_MAX) {\n        return 0;\n    }\n\n    return (uint32_t)timestamp;\n}\n\nbool get_unix_timestamp(uint32_t &timestamp) {\n    time_t now = time(nullptr);\n\n    if (now >= 1700000000 && (uint64_t)now <= UINT32_MAX) {\n        timestamp = (uint32_t)now;\n        return true;\n    }\n\n    uint32_t gps_timestamp = gps_epoch();\n\n    if (gps_timestamp >= 1700000000) {\n        timestamp = gps_timestamp;\n        return true;\n    }\n\n    return false;\n}\n\nvoid initialize_hardware() {\n    Serial.begin(9600);\n    pinMode(LED_A_PIN, OUTPUT);\n    pinMode(LED_B_PIN, OUTPUT);\n    digitalWrite(LED_A_PIN, LOW);\n    digitalWrite(LED_B_PIN, LOW);\n\n    gps_serial.setRxBufferSize(2048);\n    gps_serial.begin(GPS_BAUD, SERIAL_8N1, ESP32_RX2_PIN, ESP32_TX2_PIN);\n}\n\nvoid initialize_wifi() {\n    WiFi.mode(WIFI_STA);\n    WiFi.setAutoReconnect(true);\n    Serial.println(\"[WIFI] Connecting...\");\n    WiFi.begin(wifi_ssid, wifi_password);\n    last_wifi_attempt = millis();\n}\n\nvoid maintain_wifi() {\n    if (WiFi.status() == WL_CONNECTED) {\n        if (!wifi_connected_before) {\n            wifi_connected_before = true;\n            Serial.printf(\"[WIFI] Connected | IP=%s\\n\", WiFi.localIP().toString().c_str());\n\n            configTime(0, 0, \"pool.ntp.org\", \"time.google.com\");\n            last_mqtt_attempt = millis() - mqtt_retry_ms;\n        }\n        return;\n    }\n\n    if (wifi_connected_before) {\n        wifi_connected_before = false;\n        Serial.println(\"[WIFI] Disconnected | Reconnecting...\");\n\n        if (mqtt.connected()) {\n            mqtt.disconnect();\n        }\n\n        mqtt_connected_before = false;\n        last_wifi_attempt = millis() - wifi_retry_ms;\n    }\n\n    unsigned long now = millis();\n\n    if (now - last_wifi_attempt >= wifi_retry_ms) {\n        last_wifi_attempt = now;\n        Serial.println(\"[WIFI] Reconnecting...\");\n        WiFi.reconnect();\n    }\n}\n\nvoid initialize_mqtt() {\n    mqtt_client.setCACert(mqtt_root_ca);\n    mqtt_client.setHandshakeTimeout(10);\n\n    mqtt.setServer(mqtt_server, mqtt_port);\n    mqtt.setKeepAlive(mqtt_keep_alive);\n    mqtt.setSocketTimeout(5);\n    mqtt.setBufferSize(512);\n    mqtt.setCallback(on_message);\n\n    Serial.printf(\"[MQTT] TLS Broker | %s:%u\\n\", mqtt_server, mqtt_port);\n}\n\nvoid reconnect_mqtt() {\n    if (mqtt.connected()) {\n        if (!mqtt_connected_before) {\n            mqtt_connected_before = true;\n            Serial.println(\"[MQTT] Connected (TLS)\");\n        }\n        return;\n    }\n\n    if (mqtt_connected_before) {\n        mqtt_connected_before = false;\n        Serial.println(\"[MQTT] Disconnected | Reconnecting...\");\n    }\n\n    if (millis() - last_mqtt_attempt < mqtt_retry_ms) {\n        return;\n    }\n\n    last_mqtt_attempt = millis();\n\n    if (time(nullptr) < 1700000000) {\n        Serial.println(\"[TLS] Waiting for NTP time sync...\");\n        return;\n    }\n\n    Serial.println(\"[MQTT] Reconnecting (TLS)...\");\n\n    if (mqtt.connect(DEVICE_ID, mqtt_username, mqtt_password)) {\n        if (mqtt.subscribe(mqtt_command_topic)) {\n            mqtt_connected_before = true;\n            Serial.println(\"[MQTT] Connected (TLS) | Command subscribed\");\n        } else {\n            Serial.println(\"[MQTT] Connected (TLS) | Subscribe failed\");\n            mqtt.disconnect();\n        }\n    } else {\n        Serial.printf(\"[MQTT] Connect failed | State=%d\\n\", mqtt.state());\n\n        char tls_err[128];\n        if (mqtt_client.lastError(tls_err, sizeof(tls_err)) < 0) {\n            Serial.printf(\"[TLS] Error | %s\\n\", tls_err);\n        }\n    }\n}\n\nvoid discard_gps_data() {\n    while (gps_serial.available() > 0) {\n        gps_serial.read();\n    }\n}\n\nvoid set_active(bool enable) {\n    if (gps_enabled == enable) {\n        return;\n    }\n\n    gps_enabled = enable;\n\n    if (enable) {\n        gps = TinyGPSPlus();\n        last_gps_fix_state = -1;\n        Serial.println(\"[GPS] Enabled | Waiting for fix\");\n    } else {\n        Serial.println(\"[GPS] Disabled\");\n    }\n}\n\nbool is_valid_interval(int interval) {\n    return interval == 0 || interval == 2 || interval == 5 || interval == 10 || interval == 30;\n}\n\nvoid reject_command(const char* reason) {\n    Serial.printf(\"[CMD] Rejected | %s\\n\", reason);\n}\n\nvoid handle_command(char* command) {\n    StaticJsonDocument<256> doc;\n    DeserializationError error = deserializeJson(doc, command);\n\n    if (error) {\n        reject_command(\"Invalid JSON\");\n        return;\n    }\n\n    JsonVariantConst device_value = doc[\"device_id\"];\n    JsonVariantConst active_value = doc[\"active\"];\n    JsonVariantConst timestamp_value = doc[\"timestamp\"];\n\n    if (!device_value.is<const char*>()) {\n        reject_command(\"Missing or invalid device_id\");\n        return;\n    }\n\n    if (!active_value.is<bool>()) {\n        reject_command(\"Missing or invalid active\");\n        return;\n    }\n\n    if (!timestamp_value.is<uint32_t>()) {\n        reject_command(\"Missing or invalid timestamp\");\n        return;\n    }\n\n    const char* command_device_id = device_value.as<const char*>();\n    bool requested_active = active_value.as<bool>();\n    uint32_t command_timestamp = timestamp_value.as<uint32_t>();\n\n    Serial.printf(\"[CMD] Received | device=%s active=%s\\n\", command_device_id, requested_active ? \"true\" : \"false\");\n\n    if (strcmp(command_device_id, DEVICE_ID) != 0) {\n        reject_command(\"Device ID mismatch\");\n        return;\n    }\n\n    if (command_timestamp == 0) {\n        reject_command(\"Invalid timestamp\");\n        return;\n    }\n\n    if (last_command_timestamp != 0 && command_timestamp < last_command_timestamp) {\n        reject_command(\"Older timestamp\");\n        return;\n    }\n\n    int next_interval = interval_seconds;\n\n    if (doc.containsKey(\"interval_seconds\")) {\n        JsonVariantConst interval_value = doc[\"interval_seconds\"];\n\n        if (!interval_value.is<int>()) {\n            reject_command(\"Invalid interval_seconds\");\n            return;\n        }\n\n        next_interval = interval_value.as<int>();\n\n        if (!is_valid_interval(next_interval)) {\n            reject_command(\"Unsupported interval\");\n            return;\n        }\n    } else if (requested_active) {\n        next_interval = 10;\n    }\n\n    if (requested_active && next_interval == 0) {\n        next_interval = 10;\n    }\n\n    last_command_timestamp = command_timestamp;\n    interval_seconds = next_interval;\n    set_active(requested_active);\n    last_send = millis();\n\n    Serial.printf(\"[CMD] Accepted | GPS=%s interval=%ds\\n\", requested_active ? \"ON\" : \"OFF\", interval_seconds);\n}\n\nvoid on_message(char* topic, byte* payload, unsigned int length) {\n    if (length >= cmd_size) {\n        reject_command(\"Payload too large\");\n        return;\n    }\n\n    char command_buffer[cmd_size];\n    memcpy(command_buffer, payload, length);\n    command_buffer[length] = '\\0';\n\n    handle_command(command_buffer);\n}\n\nvoid read_gps_data() {\n    while (gps_serial.available() > 0) {\n        gps.encode(gps_serial.read());\n    }\n}\n\nvoid update_gps_status() {\n    int current_fix = gps.location.isValid() ? 1 : 0;\n\n    if (current_fix == last_gps_fix_state) {\n        return;\n    }\n\n    last_gps_fix_state = current_fix;\n\n    uint32_t satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;\n\n    if (current_fix) {\n        Serial.printf(\"[GPS] Fix OK | Satellites=%lu\\n\", (unsigned long)satellites);\n    } else {\n        Serial.printf(\"[GPS] No fix | Satellites=%lu\\n\", (unsigned long)satellites);\n    }\n}\n\nbool is_telemetry_interval_elapsed() {\n    if (!gps_enabled || interval_seconds <= 0) {\n        return false;\n    }\n\n    unsigned long interval_ms = (unsigned long)interval_seconds * 1000UL;\n\n    if (millis() - last_send >= interval_ms) {\n        last_send = millis();\n        return true;\n    }\n\n    return false;\n}\n\nvoid publish_telemetry() {\n    if (!gps.location.isValid()) {\n        Serial.println(\"[TX] Skipped | GPS fix unavailable\");\n        return;\n    }\n\n    uint32_t timestamp;\n\n    if (!get_unix_timestamp(timestamp)) {\n        Serial.println(\"[TX] Skipped | Timestamp unavailable\");\n        return;\n    }\n\n    double latitude = gps.location.lat();\n    double longitude = gps.location.lng();\n    double speed = gps.speed.kmph();\n    uint32_t satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;\n\n    StaticJsonDocument<256> doc;\n    doc[\"device_id\"] = DEVICE_ID;\n    doc[\"lat\"] = latitude;\n    doc[\"lng\"] = longitude;\n    doc[\"speed\"] = speed;\n    doc[\"satellites\"] = satellites;\n    doc[\"timestamp\"] = timestamp;\n\n    char payload[msg_size];\n\n    size_t payload_length = serializeJson(doc, payload, sizeof(payload));\n\n    if (payload_length == 0 || payload_length >= sizeof(payload)) {\n        Serial.println(\"[TX] Failed | Payload error\");\n        return;\n    }\n\n    if (mqtt.publish(mqtt_topic, payload)) {\n        last_publish_ok = millis();\n\n        Serial.printf(\n            \"[TX] Publishing | DEVICE=%s LAT=%.6f LON=%.6f SPEED=%.1fkm/h SAT=%lu TIMESTAMP=%lu | Success\\n\",\n            DEVICE_ID,\n            latitude,\n            longitude,\n            speed,\n            (unsigned long)satellites,\n            (unsigned long)timestamp\n        );\n    }\n}\n\nvoid process_gps() {\n    if (!gps_enabled) {\n        discard_gps_data();\n        return;\n    }\n\n    read_gps_data();\n    update_gps_status();\n\n    if (!is_telemetry_interval_elapsed()) {\n        return;\n    }\n\n    last_send = millis();\n\n    uint32_t satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;\n\n    if (!gps.location.isValid()) {\n        Serial.printf(\"[GPS] Waiting for fix | SAT=%lu\\n\", (unsigned long)satellites);\n        return;\n    }\n\n    publish_telemetry();\n}\n\nvoid update_leds() {\n    unsigned long now = millis();\n\n    if (WiFi.status() != WL_CONNECTED) {\n        if (now - last_led_a_toggle >= blink_fast_ms) {\n            last_led_a_toggle = now;\n            led_a_state = !led_a_state;\n            digitalWrite(LED_A_PIN, led_a_state);\n        }\n    } else if (!mqtt.connected()) {\n        if (now - last_led_a_toggle >= blink_slow_ms) {\n            last_led_a_toggle = now;\n            led_a_state = !led_a_state;\n            digitalWrite(LED_A_PIN, led_a_state);\n        }\n    } else {\n        led_a_state = true;\n        digitalWrite(LED_A_PIN, HIGH);\n    }\n\n    if (!gps_enabled) {\n        led_b_state = false;\n        digitalWrite(LED_B_PIN, LOW);\n    } else if (!gps.location.isValid()) {\n        if (now - last_led_b_toggle >= blink_slow_ms) {\n            last_led_b_toggle = now;\n            led_b_state = !led_b_state;\n            digitalWrite(LED_B_PIN, led_b_state);\n        }\n    } else {\n        led_b_state = !(last_publish_ok != 0 && now - last_publish_ok < blip_ms);\n        digitalWrite(LED_B_PIN, led_b_state);\n    }\n}\n\nvoid setup() {\n    initialize_hardware();\n    initialize_wifi();\n    initialize_mqtt();\n}\n\nvoid loop() {\n    process_gps();\n    maintain_wifi();\n\n    if (WiFi.status() == WL_CONNECTED) {\n        reconnect_mqtt();\n\n        if (mqtt.connected()) {\n            mqtt.loop();\n        }\n    } else if (mqtt.connected()) {\n        mqtt.disconnect();\n    }\n\n    process_gps();\n    update_leds();\n}"
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "gps_neo6m_1794635750557_n8kvanhla",
+      "metadataId": "gps-neo6m",
+      "x": 708.3791652591481,
+      "y": 473.31714938215384,
+      "properties": {
+        "lat": 40.4168,
+        "lng": -3.7038,
+        "altitude": 667,
+        "speed": 0
+      }
+    },
+    {
+      "id": "breadboard_1794635813126_a2f41htug",
+      "metadataId": "breadboard",
+      "x": 136.93942571801813,
+      "y": 259.14991551765644,
+      "properties": {}
+    },
+    {
+      "id": "led_1794694862341_5olr90089",
+      "metadataId": "led",
+      "x": 676.3534782304745,
+      "y": 152.42542964272207,
+      "properties": {
+        "value": false,
+        "brightness": 1,
+        "color": "red",
+        "lightColor": null,
+        "label": "",
+        "flip": false
+      }
+    },
+    {
+      "id": "led_1794694866265_covcy6zoo",
+      "metadataId": "led",
+      "x": 712.4890112247899,
+      "y": 151.79090306188922,
+      "properties": {
+        "value": false,
+        "brightness": 1,
+        "color": "red",
+        "lightColor": null,
+        "label": "",
+        "flip": false,
+        "rotation": 0
+      }
+    },
+    {
+      "id": "resistor_1k_1794695538699_wypu22np7",
+      "metadataId": "resistor-1k",
+      "x": 633.214274551897,
+      "y": 231.17133930474907,
+      "properties": {
+        "value": "1000",
+        "rotation": 90
+      }
+    },
+    {
+      "id": "resistor_1k_1794695541776_tzaxy1903",
+      "metadataId": "resistor-1k",
+      "x": 672.7421239568105,
+      "y": 230.69038979959367,
+      "properties": {
+        "value": "1000",
+        "rotation": 90
+      }
+    }
+  ],
+  "wires": [
+    {
+      "waypoints": [
+        {
+          "x": 833.4043709038053,
+          "y": 459.08567780413944
+        },
+        {
+          "x": 725.2857693337991,
+          "y": 459.08567780413944
+        }
+      ],
+      "id": "wire-1794694617474",
+      "start": {
+        "componentId": "esp32",
+        "pinName": "3V3",
+        "x": 971.4043709038053,
+        "y": 400.75075567280373
+      },
+      "end": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "bp.50",
+        "x": 733.5127590513514,
+        "y": 457.14991551765644
+      },
+      "color": "#cc0000",
+      "autoRouted": false
+    },
+    {
+      "waypoints": [
+        {
+          "x": 846.4043709038053,
+          "y": 446.0980938027943
+        }
+      ],
+      "id": "wire-1794694624401",
+      "start": {
+        "componentId": "esp32",
+        "pinName": "GND2",
+        "x": 971.4043709038053,
+        "y": 387.75075567280373
+      },
+      "end": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "bn.50",
+        "x": 733.5127590513514,
+        "y": 447.5499155176565
+      },
+      "color": "#000000",
+      "autoRouted": false
+    },
+    {
+      "waypoints": [
+        {
+          "x": 723.9127590513515,
+          "y": 502.31714938215384
+        }
+      ],
+      "id": "wire-1794694665793",
+      "start": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "bp.49",
+        "x": 723.9127590513515,
+        "y": 457.14991551765644
+      },
+      "end": {
+        "componentId": "gps_neo6m_1794635750557_n8kvanhla",
+        "pinName": "VCC",
+        "x": 723.3791652591481,
+        "y": 502.31714938215384
+      },
+      "color": "#cc0000",
+      "autoRouted": true
+    },
+    {
+      "waypoints": [
+        {
+          "x": 707.90605487421,
+          "y": 449.0017372325186
+        },
+        {
+          "x": 715.6491040201415,
+          "y": 446.0980938027943
+        },
+        {
+          "x": 715.6491040201415,
+          "y": 553.7585866121229
+        }
+      ],
+      "id": "wire-1794694674582",
+      "start": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "bn.49",
+        "x": 723.9127590513515,
+        "y": 447.5499155176565
+      },
+      "end": {
+        "componentId": "gps_neo6m_1794635750557_n8kvanhla",
+        "pinName": "GND",
+        "x": 723.3791652591481,
+        "y": 556.3171493821538
+      },
+      "color": "#000000",
+      "autoRouted": false
+    },
+    {
+      "waypoints": [
+        {
+          "x": 704.6994257180181,
+          "y": 517.7585866121229
+        }
+      ],
+      "id": "wire-1794694749841",
+      "start": {
+        "componentId": "gps_neo6m_1794635750557_n8kvanhla",
+        "pinName": "RX",
+        "x": 723.3791652591481,
+        "y": 520.3171493821538
+      },
+      "end": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "58b.j",
+        "x": 704.6994257180181,
+        "y": 418.7499155176564
+      },
+      "color": "#00FFFF",
+      "autoRouted": false
+    },
+    {
+      "waypoints": [
+        {
+          "x": 695.0994257180181,
+          "y": 535.7585866121229
+        }
+      ],
+      "id": "wire-1794694753070",
+      "start": {
+        "componentId": "gps_neo6m_1794635750557_n8kvanhla",
+        "pinName": "TX",
+        "x": 723.3791652591481,
+        "y": 538.3171493821538
+      },
+      "end": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "57b.j",
+        "x": 695.0994257180181,
+        "y": 418.7499155176564
+      },
+      "color": "#FF00FF",
+      "autoRouted": false
+    },
+    {
+      "waypoints": [
+        {
+          "x": 909.4043709038053,
+          "y": 409.14991551765644
+        }
+      ],
+      "id": "wire-1794694766778",
+      "start": {
+        "componentId": "esp32",
+        "pinName": "17",
+        "x": 971.4043709038053,
+        "y": 324.75075567280373
+      },
+      "end": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "58b.i",
+        "x": 704.6994257180181,
+        "y": 409.14991551765644
+      },
+      "color": "#00FFFF",
+      "autoRouted": false
+    },
+    {
+      "waypoints": [
+        {
+          "x": 897.4043709038053,
+          "y": 398.00693548968485
+        },
+        {
+          "x": 798.7277103577991,
+          "y": 398.00693548968485
+        },
+        {
+          "x": 695.0994257180181,
+          "y": 398.00693548968485
+        }
+      ],
+      "id": "wire-1794694770143",
+      "start": {
+        "componentId": "esp32",
+        "pinName": "16",
+        "x": 971.4043709038053,
+        "y": 336.75075567280373
+      },
+      "end": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "57b.i",
+        "x": 695.0994257180181,
+        "y": 409.14991551765644
+      },
+      "color": "#FF00FF",
+      "autoRouted": false
+    },
+    {
+      "waypoints": [
+        {
+          "x": 947.4043709038053,
+          "y": 245.06705105376844
+        },
+        {
+          "x": 770.0702544688789,
+          "y": 245.06705105376844
+        },
+        {
+          "x": 770.0702544688789,
+          "y": 351.5499155176564
+        }
+      ],
+      "id": "wire-1794695337363",
+      "start": {
+        "componentId": "esp32",
+        "pinName": "32",
+        "x": 843.4043709038053,
+        "y": 286.75075567280373
+      },
+      "end": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "63t.e",
+        "x": 752.6994257180181,
+        "y": 351.5499155176564
+      },
+      "color": "#00FFFF",
+      "autoRouted": false
+    },
+    {
+      "waypoints": [
+        {
+          "x": 935.4043709038053,
+          "y": 236.1113887614693
+        },
+        {
+          "x": 761.8608973676047,
+          "y": 236.1113887614693
+        },
+        {
+          "x": 761.8608973676047,
+          "y": 341.94991551765645
+        }
+      ],
+      "id": "wire-1794695359180",
+      "start": {
+        "componentId": "esp32",
+        "pinName": "33",
+        "x": 843.4043709038053,
+        "y": 298.75075567280373
+      },
+      "end": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "62t.d",
+        "x": 743.0994257180181,
+        "y": 341.94991551765645
+      },
+      "color": "#FF00FF",
+      "autoRouted": false
+    },
+    {
+      "waypoints": [
+        {
+          "x": 752.6994257180181,
+          "y": 199.79090306188922
+        }
+      ],
+      "id": "wire-1794695455364",
+      "start": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "63t.a",
+        "x": 752.6994257180181,
+        "y": 313.14991551765644
+      },
+      "end": {
+        "componentId": "led_1794694866265_covcy6zoo",
+        "pinName": "A",
+        "x": 743.4890112247899,
+        "y": 199.79090306188922
+      },
+      "color": "#00FFFF",
+      "autoRouted": false
+    },
+    {
+      "waypoints": [
+        {
+          "x": 743.0994257180181,
+          "y": 305.2808264666029
+        },
+        {
+          "x": 707.90605487421,
+          "y": 305.2808264666029
+        },
+        {
+          "x": 707.90605487421,
+          "y": 200.42542964272207
+        }
+      ],
+      "id": "wire-1794695459703",
+      "start": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "62t.a",
+        "x": 743.0994257180181,
+        "y": 313.14991551765644
+      },
+      "end": {
+        "componentId": "led_1794694862341_5olr90089",
+        "pinName": "A",
+        "x": 707.3534782304745,
+        "y": 200.42542964272207
+      },
+      "color": "#FF00FF",
+      "autoRouted": false
+    },
+    {
+      "waypoints": [],
+      "id": "wire-1794695551012",
+      "start": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "tn.41",
+        "x": 637.5127590513514,
+        "y": 274.74991551765646
+      },
+      "end": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "bn.41",
+        "x": 637.5127590513514,
+        "y": 447.5499155176565
+      },
+      "color": "#000000",
+      "autoRouted": false
+    },
+    {
+      "waypoints": [
+        {
+          "x": 733.5921239568105,
+          "y": 199.79090306188922
+        }
+      ],
+      "id": "wire-1794695564686",
+      "start": {
+        "componentId": "resistor_1k_1794695541776_tzaxy1903",
+        "pinName": "1",
+        "x": 733.5921239568105,
+        "y": 214.19038979959367
+      },
+      "end": {
+        "componentId": "led_1794694866265_covcy6zoo",
+        "pinName": "C",
+        "x": 733.4890112247899,
+        "y": 199.79090306188922
+      },
+      "color": "#000000",
+      "autoRouted": true
+    },
+    {
+      "waypoints": [
+        {
+          "x": 694.0642745518969,
+          "y": 200.42542964272207
+        }
+      ],
+      "id": "wire-1794695596561",
+      "start": {
+        "componentId": "resistor_1k_1794695538699_wypu22np7",
+        "pinName": "1",
+        "x": 694.0642745518969,
+        "y": 214.67133930474904
+      },
+      "end": {
+        "componentId": "led_1794694862341_5olr90089",
+        "pinName": "C",
+        "x": 697.3534782304745,
+        "y": 200.42542964272207
+      },
+      "color": "#000000",
+      "autoRouted": true
+    },
+    {
+      "id": "bbwire-resistor_1k_1794695538699_wypu22np7-0-tn.46",
+      "start": {
+        "componentId": "resistor_1k_1794695538699_wypu22np7",
+        "pinName": "2",
+        "x": 694.064274551897,
+        "y": 273.471339304749
+      },
+      "end": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "tn.46",
+        "x": 695.1127590513514,
+        "y": 274.74991551765646
+      },
+      "waypoints": [],
+      "color": "#000000",
+      "bb": true
+    },
+    {
+      "id": "bbwire-resistor_1k_1794695541776_tzaxy1903-0-tn.50",
+      "start": {
+        "componentId": "resistor_1k_1794695541776_tzaxy1903",
+        "pinName": "2",
+        "x": 733.5921239568105,
+        "y": 272.99038979959363
+      },
+      "end": {
+        "componentId": "breadboard_1794635813126_a2f41htug",
+        "pinName": "tn.50",
+        "x": 733.5127590513514,
+        "y": 274.74991551765646
+      },
+      "waypoints": [],
+      "color": "#000000",
+      "bb": true
+    }
+  ],
+  "activeBoardId": "esp32"
+}
