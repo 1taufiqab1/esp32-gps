@@ -19,6 +19,7 @@
 
 ### Library Arduino
 - `WiFi` — koneksi WiFi.
+- `WiFiClientSecure` — keamanan koneksi WiFi.
 - `PubSubClient` — komunikasi MQTT.
 - `TinyGPSPlus` — membaca dan mengolah data GPS.
 - `ArduinoJson` — parsing perintah JSON.
@@ -42,6 +43,8 @@
 ## 3. Konfigurasi MQTT
 
 ### MQTT Broker
+
+> Note: *Contoh value MQTT Broker pada broker public*
 
 | Konfigurasi | Nilai |
 |---|---|
@@ -204,8 +207,13 @@ Terdapat dua LED untuk menunjukkan kondisi perangkat.
 6. Ketika lokasi valid dan interval terpenuhi, data dikirim ke MQTT.
 7. LED diperbarui sesuai kondisi WiFi, MQTT, dan GPS.
 
-## 7. Catatan
+## 7 Mengatur Variable `secrets.h`
 
-- Masih broker publik.
-- Belum pakai `WiFiClientSecure` dan config cert CA.
+1. Buat file `secrets.h` di `sketch/` **atau** ubah nama file `secrets.example.h` menjadi `secrets.h`.
+2. Ubah nilai variable di dalam `secrets.h`(format mengacu pada `secrets.example.h`).
+3. Isi variable WIFI, MQTT, dan CERT nya sesuai dengan nilai yang sudah ditetapkan.
+
+## 8. Catatan
+
 - Inteval pengiriman data default 10 detik.
+
